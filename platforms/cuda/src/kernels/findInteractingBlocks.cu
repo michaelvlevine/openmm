@@ -35,6 +35,549 @@ private:
     __half v[3];
 };
 
+#ifdef USE_LARGE_BLOCKS
+enum { REBUILD_FLAG_INDEX = 0, LAST_REBUILD_STEP_INDEX = 1, NUM_DISPERSED_BLOCKS_INDEX = 2 };
+
+__device__ real4 broadcastWarpPos(real4 pos, int sourceLane) {
+    return make_real4(
+        __shfl_sync(0xffffffff, pos.x, sourceLane),
+        __shfl_sync(0xffffffff, pos.y, sourceLane),
+        __shfl_sync(0xffffffff, pos.z, sourceLane), 0);
+}
+
+__device__ void reduceWarpBoundingBox(real4& minPos, real4& maxPos) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        minPos.x = min(minPos.x, __shfl_xor_sync(0xffffffff, minPos.x, offset));
+        minPos.y = min(minPos.y, __shfl_xor_sync(0xffffffff, minPos.y, offset));
+        minPos.z = min(minPos.z, __shfl_xor_sync(0xffffffff, minPos.z, offset));
+        maxPos.x = max(maxPos.x, __shfl_xor_sync(0xffffffff, maxPos.x, offset));
+        maxPos.y = max(maxPos.y, __shfl_xor_sync(0xffffffff, maxPos.y, offset));
+        maxPos.z = max(maxPos.z, __shfl_xor_sync(0xffffffff, maxPos.z, offset));
+    }
+}
+
+/**
+ * Check whether any atom has moved past the neighbor-list skin and update block half-widths on non-rebuild steps.
+ */
+extern "C" __global__ void findBlockBounds(int numAtoms, real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        const real4* __restrict__ posq, real4* __restrict__ blockCenter, real4* __restrict__ blockBoundingBox, int* __restrict__ rebuildNeighborList,
+        const real4* __restrict__ oldPositions, unsigned int* __restrict__ interactionCount, bool forceRebuild, unsigned int neighborListStep) {
+    const int indexInWarp = threadIdx.x%32;
+    bool resetCounts = (forceRebuild && blockIdx.x == 0 && threadIdx.x == 0);
+    if (!forceRebuild) {
+        const int warpIndex = (blockIdx.x*blockDim.x+threadIdx.x)/32;
+        const int totalWarps = (blockDim.x*gridDim.x)/32;
+        bool rebuild = false;
+        for (int blockIndex = warpIndex; blockIndex < NUM_BLOCKS; blockIndex += totalWarps) {
+            int atomIndex = blockIndex*TILE_SIZE+indexInWarp;
+            bool isValidAtom = (atomIndex < numAtoms);
+            real4 pos = (isValidAtom ? posq[atomIndex] : make_real4(0, 0, 0, 0));
+            if (isValidAtom) {
+                real4 delta = oldPositions[atomIndex]-pos;
+                rebuild |= (delta.x*delta.x + delta.y*delta.y + delta.z*delta.z > 0.25f*PADDING*PADDING);
+            }
+            real4 center = broadcastWarpPos(indexInWarp == 0 ? blockCenter[blockIndex] : make_real4(0, 0, 0, 0), 0);
+            real4 blockSize = make_real4(0, 0, 0, 0);
+            if (isValidAtom) {
+#ifdef USE_PERIODIC
+                APPLY_PERIODIC_TO_POS_WITH_CENTER(pos, center)
+#endif
+                blockSize = make_real4(FABS(pos.x-center.x), FABS(pos.y-center.y), FABS(pos.z-center.z), 0);
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                blockSize.x = max(blockSize.x, __shfl_xor_sync(0xffffffff, blockSize.x, offset));
+                blockSize.y = max(blockSize.y, __shfl_xor_sync(0xffffffff, blockSize.y, offset));
+                blockSize.z = max(blockSize.z, __shfl_xor_sync(0xffffffff, blockSize.z, offset));
+            }
+            if (indexInWarp == 0)
+                blockBoundingBox[blockIndex] = blockSize;
+        }
+        int rebuildFlags = BALLOT(rebuild);
+        resetCounts = (rebuildFlags != 0 && indexInWarp == 0);
+    }
+    if (resetCounts) {
+        rebuildNeighborList[LAST_REBUILD_STEP_INDEX] = (int) neighborListStep;
+        rebuildNeighborList[NUM_DISPERSED_BLOCKS_INDEX] = 0;
+        interactionCount[0] = 0;
+        interactionCount[1] = 0;
+    }
+}
+
+/**
+ * Compute per-block and 32-block superblock bounding boxes on rebuild steps, routing wide blocks to the dispersed list.
+ */
+extern "C" __global__ void sortBoxData(unsigned int* __restrict__ sortedBlocks, real4* __restrict__ blockCenter,
+        real4* __restrict__ blockBoundingBox, half3* __restrict__ sortedBlockBoundingBox,
+        real4* __restrict__ largeBlockCenter, half3* __restrict__ largeBlockBoundingBox, real4 periodicBoxSize,
+        real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        const real4* __restrict__ posq, real4* __restrict__ oldPositions,
+        int* __restrict__ rebuildNeighborList, unsigned int neighborListStep) {
+    if ((unsigned int) rebuildNeighborList[LAST_REBUILD_STEP_INDEX] != neighborListStep) {
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            rebuildNeighborList[REBUILD_FLAG_INDEX] = 0;
+        return;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        rebuildNeighborList[REBUILD_FLAG_INDEX] = 1;
+    const int indexInWarp = threadIdx.x%32;
+    const int warpInBlock = threadIdx.x/32;
+    const int numSuperblocks = (NUM_BLOCKS+31)/32;
+    const real compactBlockLimit = 1.65f*PADDED_CUTOFF;
+    unsigned int* compactBlockMasks = sortedBlocks;
+    unsigned int* dispersedBlockIndices = compactBlockMasks+numSuperblocks;
+    __shared__ real4 sharedBlockCenter[32];
+    __shared__ real4 sharedBlockSize[32];
+    for (int superblockIndex = blockIdx.x; superblockIndex < numSuperblocks; superblockIndex += gridDim.x) {
+        #pragma unroll
+        for (int pass = 0; pass < 4; pass++) {
+            int blockInSuperblock = pass*8 + warpInBlock;
+            int blockIndex = superblockIndex*32 + blockInSuperblock;
+            if (blockIndex < NUM_BLOCKS) {
+                int atomIndex = blockIndex*TILE_SIZE + indexInWarp;
+                bool isValidAtom = (atomIndex < NUM_ATOMS);
+                real4 pos = (isValidAtom ? posq[atomIndex] : make_real4(0, 0, 0, 0));
+                if (isValidAtom)
+                    oldPositions[atomIndex] = pos;
+#ifdef USE_PERIODIC
+                if (indexInWarp == 0) {
+                    APPLY_PERIODIC_TO_POS(pos)
+                }
+#endif
+                real4 firstAtomPos = broadcastWarpPos(pos, 0);
+                if (!isValidAtom)
+                    pos = firstAtomPos;
+#ifdef USE_PERIODIC
+                else if (indexInWarp > 0) {
+                    APPLY_PERIODIC_TO_POS_WITH_CENTER(pos, firstAtomPos)
+                }
+#endif
+                real4 minPos = pos, maxPos = pos;
+                reduceWarpBoundingBox(minPos, maxPos);
+                real4 center = 0.5f*(maxPos+minPos);
+#ifdef USE_PERIODIC
+                if (isValidAtom) {
+                    APPLY_PERIODIC_TO_POS_WITH_CENTER(pos, center)
+                }
+                else
+                    pos = center;
+                minPos = maxPos = pos;
+                reduceWarpBoundingBox(minPos, maxPos);
+                center = 0.5f*(maxPos+minPos);
+#endif
+                real4 blockSize = 0.5f*(maxPos-minPos);
+                real4 delta = pos-center;
+                real maxRadiusSquared = (isValidAtom ? delta.x*delta.x + delta.y*delta.y + delta.z*delta.z : (real) 0);
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    maxRadiusSquared = max(maxRadiusSquared, __shfl_xor_sync(0xffffffff, maxRadiusSquared, offset));
+                center.w = SQRT(maxRadiusSquared);
+                if (indexInWarp == 0) {
+                    half3 roundedBox(trimTo3(blockSize));
+                    real3 roundedSize = roundedBox.toReal3();
+                    blockBoundingBox[blockIndex] = blockSize;
+                    blockCenter[blockIndex] = center;
+                    sortedBlockBoundingBox[blockIndex] = roundedBox;
+                    sharedBlockCenter[blockInSuperblock] = center;
+                    sharedBlockSize[blockInSuperblock] = make_real4(roundedSize.x, roundedSize.y, roundedSize.z, 0);
+                }
+            }
+        }
+        __syncthreads();
+        if (warpInBlock == 0) {
+            int blockIndex = superblockIndex*32 + indexInWarp;
+            bool isValidBlock = (blockIndex < NUM_BLOCKS);
+            real4 center = (isValidBlock ? sharedBlockCenter[indexInWarp] : make_real4(0, 0, 0, 0));
+            real4 roundedSize = (isValidBlock ? sharedBlockSize[indexInWarp] : make_real4(0, 0, 0, 0));
+            bool isDispersedBlock = (isValidBlock && (roundedSize.x > compactBlockLimit || roundedSize.y > compactBlockLimit || roundedSize.z > compactBlockLimit
+#ifdef USE_PERIODIC
+                || 0.5f*periodicBoxSize.x-roundedSize.x < PADDED_CUTOFF
+                || 0.5f*periodicBoxSize.y-roundedSize.y < PADDED_CUTOFF
+                || 0.5f*periodicBoxSize.z-roundedSize.z < PADDED_CUTOFF
+#endif
+            ));
+            bool isCompactBlock = (isValidBlock && !isDispersedBlock);
+            unsigned int compactMask = BALLOT(isCompactBlock);
+            unsigned int dispersedMask = BALLOT(isDispersedBlock);
+            int firstCompactLane = (compactMask != 0 ? __ffs(compactMask)-1 : 0);
+            real4 firstCompactCenter = broadcastWarpPos(center, firstCompactLane);
+            if (!isCompactBlock) {
+                center = firstCompactCenter;
+                roundedSize = make_real4(0, 0, 0, 0);
+            }
+#ifdef USE_PERIODIC
+            else if (indexInWarp != firstCompactLane) {
+                APPLY_PERIODIC_TO_POS_WITH_CENTER(center, firstCompactCenter)
+            }
+#endif
+            real4 minPos = center-roundedSize;
+            real4 maxPos = center+roundedSize;
+            reduceWarpBoundingBox(minPos, maxPos);
+            real4 superblockCenter = 0.5f*(maxPos+minPos);
+#ifdef USE_PERIODIC
+            if (isCompactBlock) {
+                APPLY_PERIODIC_TO_POS_WITH_CENTER(center, superblockCenter)
+            }
+            else
+                center = superblockCenter;
+            minPos = center-roundedSize;
+            maxPos = center+roundedSize;
+            reduceWarpBoundingBox(minPos, maxPos);
+            superblockCenter = 0.5f*(maxPos+minPos);
+#endif
+            if (indexInWarp == 0) {
+                largeBlockCenter[superblockIndex] = superblockCenter;
+                largeBlockBoundingBox[superblockIndex] = half3(trimTo3(0.5f*(maxPos-minPos)));
+                compactBlockMasks[superblockIndex] = compactMask;
+            }
+            if (dispersedMask != 0) {
+                unsigned int dispersedOffset = (indexInWarp == 0 ? atomicAdd((unsigned int*) &rebuildNeighborList[NUM_DISPERSED_BLOCKS_INDEX], (unsigned int) __popc(dispersedMask)) : 0);
+                dispersedOffset = __shfl_sync(0xffffffff, dispersedOffset, 0);
+                if (isDispersedBlock)
+                    dispersedBlockIndices[dispersedOffset + __popc(dispersedMask & ((1u<<indexInWarp)-1u))] = blockIndex;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ int saveSinglePairs(int x, int* atoms, int* flags, int length, unsigned int maxSinglePairs, unsigned int* singlePairCount, int2* singlePairs) {
+    // Record interactions that should be computed as single pairs rather than in blocks.
+
+    const int indexInWarp = threadIdx.x%32;
+    int sum = 0;
+    #pragma unroll 8 // (GROUP_SIZE / TILE_SIZE)
+    for (int i = indexInWarp; i < length; i += 32) {
+        int count = __popc(flags[i]);
+        sum += (count <= MAX_BITS_FOR_PAIRS ? count : 0);
+    }
+    for (int i = 1; i < 32; i *= 2) {
+        int n = __shfl_up_sync(0xffffffff, sum, i);
+        if (indexInWarp >= i)
+            sum += n;
+    }
+    unsigned int pairStartIndex = (indexInWarp == 31 ? atomicAdd(singlePairCount, (unsigned int) sum) : 0);
+    pairStartIndex = __shfl_sync(0xffffffff, pairStartIndex, 31);
+    int prevSum = __shfl_up_sync(0xffffffff, sum, 1);
+    unsigned int pairIndex = pairStartIndex + (indexInWarp > 0 ? prevSum : 0);
+    for (int i = indexInWarp; i < length; i += 32) {
+        int count = __popc(flags[i]);
+        if (count <= MAX_BITS_FOR_PAIRS && pairIndex+count <= maxSinglePairs) {
+            int f = flags[i];
+            while (f != 0) {
+                singlePairs[pairIndex] = make_int2(atoms[i], x*TILE_SIZE+__ffs(f)-1);
+                f &= f-1;
+                pairIndex++;
+            }
+        }
+    }
+
+    // Compact the remaining interactions.
+
+    const int warpMask = (1<<indexInWarp)-1;
+    int numCompacted = 0;
+    for (int start = 0; start < length; start += 32) {
+        int i = start+indexInWarp;
+        int atom = (i < length ? atoms[i] : 0);
+        int flag = (i < length ? flags[i] : 0);
+        bool include = (i < length && __popc(flag) > MAX_BITS_FOR_PAIRS);
+        int includeFlags = BALLOT(include);
+        if (include) {
+            int index = numCompacted+__popc(includeFlags&warpMask);
+            atoms[index] = atom;
+            flags[index] = flag;
+        }
+        numCompacted += __popc(includeFlags);
+    }
+    __syncwarp();
+    return numCompacted;
+}
+
+extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInteractions(real4 periodicBoxSize, real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
+        unsigned int* __restrict__ interactionCount, int* __restrict__ interactingTiles, unsigned int* __restrict__ interactingAtoms,
+        int2* __restrict__ singlePairs, const real4* __restrict__ posq, unsigned int maxTiles, unsigned int maxSinglePairs, unsigned int startBlockIndex,
+        unsigned int numBlocks, const unsigned int* __restrict__ sortedBlocks, const real4* __restrict__ blockCenter, const half3* __restrict__ sortedBlockBoundingBox,
+        const real4* __restrict__ largeBlockCenter, const half3* __restrict__ largeBlockBoundingBox,
+        const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
+        real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
+
+    if (rebuildNeighborList[REBUILD_FLAG_INDEX] == 0)
+        return; // The neighbor list doesn't need to be rebuilt.
+
+    const int indexInWarp = threadIdx.x%32;
+    const int warpStart = threadIdx.x-indexInWarp;
+    const int totalWarps = blockDim.x*gridDim.x/32;
+    const int warpIndex = (blockIdx.x*blockDim.x+threadIdx.x)/32;
+    const int warpMask = (1<<indexInWarp)-1;
+    __shared__ int workgroupBuffer[BUFFER_SIZE*(GROUP_SIZE/32)];
+    __shared__ int workgroupFlagsBuffer[BUFFER_SIZE*(GROUP_SIZE/32)];
+    __shared__ int warpExclusions[MAX_EXCLUSIONS*(GROUP_SIZE/32)];
+    __shared__ real4 posBuffer[GROUP_SIZE];
+    int* buffer = workgroupBuffer+BUFFER_SIZE*(warpStart/32);
+    int* flagsBuffer = workgroupFlagsBuffer+BUFFER_SIZE*(warpStart/32);
+    int* exclusionsForX = warpExclusions+MAX_EXCLUSIONS*(warpStart/32);
+
+    const int numSuperblocks = (NUM_BLOCKS+31)/32;
+    const unsigned int* compactBlockMasks = sortedBlocks;
+    const unsigned int* dispersedBlockIndices = compactBlockMasks+numSuperblocks;
+    const int numDispersedBlocks = rebuildNeighborList[NUM_DISPERSED_BLOCKS_INDEX];
+
+    // Loop over blocks.
+
+    for (int block1 = startBlockIndex+warpIndex; block1 < startBlockIndex+numBlocks; block1 += totalWarps) {
+        int x = block1;
+        real4 blockCenterX = blockCenter[block1];
+        real3 blockSizeX = sortedBlockBoundingBox[block1].toReal3();
+        int neighborsInBuffer = 0;
+        const unsigned int validAtom1Mask = BALLOT(x*TILE_SIZE+indexInWarp < NUM_ATOMS);
+        real4 pos1 = (x*TILE_SIZE+indexInWarp < NUM_ATOMS ? posq[x*TILE_SIZE+indexInWarp] : make_real4(0, 0, 0, 0));
+#ifdef USE_PERIODIC
+        const bool singlePeriodicCopy = (0.5f*periodicBoxSize.x-blockSizeX.x >= PADDED_CUTOFF &&
+                                         0.5f*periodicBoxSize.y-blockSizeX.y >= PADDED_CUTOFF &&
+                                         0.5f*periodicBoxSize.z-blockSizeX.z >= PADDED_CUTOFF);
+        if (singlePeriodicCopy) {
+            APPLY_PERIODIC_TO_POS_WITH_CENTER(pos1, blockCenterX)
+        }
+#endif
+        pos1.w = 0.5f * (pos1.x * pos1.x + pos1.y * pos1.y + pos1.z * pos1.z);
+        posBuffer[threadIdx.x] = pos1;
+
+        // Load exclusion data for block x.
+
+        const int exclusionStart = exclusionRowIndices[x];
+        const int exclusionEnd = exclusionRowIndices[x+1];
+        const int numExclusions = exclusionEnd-exclusionStart;
+        #pragma unroll 4 // (MAX_EXCLUSIONS)
+        for (int j = indexInWarp; j < numExclusions; j += 32)
+            exclusionsForX[j] = exclusionIndices[exclusionStart+j];
+        __syncwarp();
+
+        // Compact block1 tests compact superblocks (block2 > block1) then all dispersed blocks;
+        // dispersed block1 tests only dispersed blocks with block2 > block1, partitioning all unordered pairs once.
+
+        const bool isCompactBlock1 = (((compactBlockMasks[block1/32] >> (block1%32)) & 1u) != 0);
+        const int startSuperblock = (block1+1)/32;
+        const int numCompactBatches = (isCompactBlock1 ? (numSuperblocks-startSuperblock+31)/32 : 0);
+        const int totalBatches = numCompactBatches + (numDispersedBlocks+31)/32;
+        int batch = -1;
+        unsigned int laneCompactMask = 0;
+        unsigned int superblockFlags = 0;
+        while (true) {
+            while (superblockFlags == 0 && ++batch < totalBatches) {
+                if (batch < numCompactBatches) {
+                    int superblockIndex = startSuperblock + batch*32 + indexInWarp;
+                    bool includeSuperblock = false;
+                    if (superblockIndex < numSuperblocks) {
+                        laneCompactMask = compactBlockMasks[superblockIndex];
+                        unsigned int afterBlock1Mask = (superblockIndex == block1/32 ? (0xfffffffeu << (block1%32)) : 0xffffffffu);
+                        if ((laneCompactMask & afterBlock1Mask) != 0) {
+                            real4 superblockCenter = largeBlockCenter[superblockIndex];
+                            real3 superblockSize = largeBlockBoundingBox[superblockIndex].toReal3();
+                            real4 blockDelta = blockCenterX-superblockCenter;
+#ifdef USE_PERIODIC
+                            APPLY_PERIODIC_TO_DELTA(blockDelta)
+#endif
+                            blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-superblockSize.x);
+                            blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-superblockSize.y);
+                            blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-superblockSize.z);
+                            includeSuperblock = (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED);
+#ifdef TRICLINIC
+                            if (periodicBoxSize.z/2-blockSizeX.z-superblockSize.z < PADDED_CUTOFF || periodicBoxSize.y/2-blockSizeX.y-superblockSize.y < PADDED_CUTOFF)
+                                includeSuperblock = true;
+#endif
+                        }
+                    }
+                    superblockFlags = BALLOT(includeSuperblock);
+                }
+                else {
+                    superblockFlags = 1u;
+                }
+            }
+            if (superblockFlags == 0)
+                break;
+            int superblockBit = __ffs(superblockFlags)-1;
+            superblockFlags &= superblockFlags-1;
+            int block2;
+            bool includeBlock2;
+            if (batch < numCompactBatches) {
+                block2 = (startSuperblock + batch*32 + superblockBit)*32 + indexInWarp;
+                unsigned int superblockCompactMask = __shfl_sync(0xffffffff, laneCompactMask, superblockBit);
+                includeBlock2 = (block2 > block1 && block2 < NUM_BLOCKS && ((superblockCompactMask >> indexInWarp) & 1u) != 0);
+            }
+            else {
+                int dispersedIndex = (batch-numCompactBatches)*32 + indexInWarp;
+                block2 = (dispersedIndex < numDispersedBlocks ? (int) dispersedBlockIndices[dispersedIndex] : -1);
+                includeBlock2 = (isCompactBlock1 ? (block2 >= 0) : (block2 > block1));
+            }
+            bool forceInclude = false;
+            real4 candidateCenterY = make_real4(0, 0, 0, 0);
+            real3 candidateSizeY = make_real3(0, 0, 0);
+            if (includeBlock2) {
+                candidateCenterY = blockCenter[block2];
+                candidateSizeY = sortedBlockBoundingBox[block2].toReal3();
+                real4 blockDelta = blockCenterX-candidateCenterY;
+#ifdef USE_PERIODIC
+                APPLY_PERIODIC_TO_DELTA(blockDelta)
+#endif
+                includeBlock2 &= (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < (PADDED_CUTOFF+blockCenterX.w+candidateCenterY.w)*(PADDED_CUTOFF+blockCenterX.w+candidateCenterY.w));
+                blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-candidateSizeY.x);
+                blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-candidateSizeY.y);
+                blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-candidateSizeY.z);
+                includeBlock2 &= (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED);
+#ifdef TRICLINIC
+                if (periodicBoxSize.z/2-blockSizeX.z-candidateSizeY.z < PADDED_CUTOFF || periodicBoxSize.y/2-blockSizeX.y-candidateSizeY.y < PADDED_CUTOFF)
+                    includeBlock2 = forceInclude = true;
+#endif
+                if (includeBlock2) {
+                    #pragma unroll 4 // (MAX_EXCLUSIONS)
+                    for (int k = 0; k < numExclusions; k++)
+                        includeBlock2 &= (exclusionsForX[k] != block2);
+                }
+            }
+
+            // Loop over any blocks we identified as potentially containing neighbors.
+
+            int includeBlockFlags = BALLOT(includeBlock2);
+            int forceIncludeFlags = BALLOT(forceInclude);
+            while (includeBlockFlags != 0) {
+                int bitIndex = __ffs(includeBlockFlags)-1;
+                includeBlockFlags &= includeBlockFlags-1;
+                forceInclude = (forceIncludeFlags>>bitIndex) & 1;
+                int y = __shfl_sync(0xffffffff, block2, bitIndex);
+                real4 blockCenterY = make_real4(
+                    __shfl_sync(0xffffffff, candidateCenterY.x, bitIndex),
+                    __shfl_sync(0xffffffff, candidateCenterY.y, bitIndex),
+                    __shfl_sync(0xffffffff, candidateCenterY.z, bitIndex),
+                    __shfl_sync(0xffffffff, candidateCenterY.w, bitIndex));
+                real3 blockSizeY = make_real3(
+                    __shfl_sync(0xffffffff, candidateSizeY.x, bitIndex),
+                    __shfl_sync(0xffffffff, candidateSizeY.y, bitIndex),
+                    __shfl_sync(0xffffffff, candidateSizeY.z, bitIndex));
+                real3 atomDelta = trimTo3(posBuffer[threadIdx.x])-trimTo3(blockCenterY);
+#ifdef USE_PERIODIC
+                APPLY_PERIODIC_TO_DELTA(atomDelta)
+#endif
+                real3 boxDelta1 = make_real3(
+                    max(0.0f, fabs(atomDelta.x)-blockSizeY.x),
+                    max(0.0f, fabs(atomDelta.y)-blockSizeY.y),
+                    max(0.0f, fabs(atomDelta.z)-blockSizeY.z));
+                int atom1InRangeFlags = BALLOT(forceInclude || (
+                    atomDelta.x*atomDelta.x+atomDelta.y*atomDelta.y+atomDelta.z*atomDelta.z < (PADDED_CUTOFF+blockCenterY.w)*(PADDED_CUTOFF+blockCenterY.w) &&
+                    boxDelta1.x*boxDelta1.x+boxDelta1.y*boxDelta1.y+boxDelta1.z*boxDelta1.z < PADDED_CUTOFF_SQUARED));
+                atom1InRangeFlags &= (int) validAtom1Mask;
+                if (atom1InRangeFlags == 0)
+                    continue;
+
+                // Check each atom in block Y for interactions.
+
+                int atom2 = y*TILE_SIZE+indexInWarp;
+                real4 pos2 = (atom2 < NUM_ATOMS ? posq[atom2] : make_real4(0, 0, 0, 0));
+#ifdef USE_PERIODIC
+                if (singlePeriodicCopy) {
+                    APPLY_PERIODIC_TO_POS_WITH_CENTER(pos2, blockCenterX)
+                }
+#endif
+                pos2.w = 0.5f * (pos2.x * pos2.x + pos2.y * pos2.y + pos2.z * pos2.z);
+                int interacts = 0;
+                if (atom2 < NUM_ATOMS) {
+#ifdef USE_PERIODIC
+                    if (!singlePeriodicCopy) {
+                        int first = __ffs(atom1InRangeFlags)-1;
+                        int last = 32-__clz(atom1InRangeFlags);
+                        for (int j = first; j < last; j++) {
+                            real3 delta = trimTo3(pos2)-trimTo3(posBuffer[warpStart+j]);
+                            APPLY_PERIODIC_TO_DELTA(delta)
+                            interacts |= (delta.x*delta.x+delta.y*delta.y+delta.z*delta.z < PADDED_CUTOFF_SQUARED ? 1<<j : 0);
+                        }
+                    }
+                    else {
+#endif
+                        real3 deltaCenterX = trimTo3(pos2)-trimTo3(blockCenterX);
+                        real3 boxDelta2 = make_real3(
+                            max(0.0f, fabs(deltaCenterX.x)-blockSizeX.x),
+                            max(0.0f, fabs(deltaCenterX.y)-blockSizeX.y),
+                            max(0.0f, fabs(deltaCenterX.z)-blockSizeX.z));
+                        if (deltaCenterX.x*deltaCenterX.x+deltaCenterX.y*deltaCenterX.y+deltaCenterX.z*deltaCenterX.z < (PADDED_CUTOFF+blockCenterX.w)*(PADDED_CUTOFF+blockCenterX.w) &&
+                                boxDelta2.x*boxDelta2.x+boxDelta2.y*boxDelta2.y+boxDelta2.z*boxDelta2.z < PADDED_CUTOFF_SQUARED) {
+                            #pragma unroll
+                            for (int half = 0; half < 32; half += 16) {
+                                if ((atom1InRangeFlags & (0xffff << half)) != 0) {
+                                    #pragma unroll
+                                    for (int j = half; j < half+16; j++) {
+                                        real4 posj = posBuffer[warpStart+j];
+                                        real halfDist2 = posj.w + pos2.w - posj.x*pos2.x - posj.y*pos2.y - posj.z*pos2.z;
+                                        interacts |= (halfDist2 < 0.5f * PADDED_CUTOFF_SQUARED ? 1<<j : 0);
+                                    }
+                                }
+                            }
+                        }
+#ifdef USE_PERIODIC
+                    }
+#endif
+                    interacts &= validAtom1Mask;
+                }
+
+                // Add any interacting atoms to the buffer.
+
+                int includeAtomFlags = BALLOT(interacts);
+                if (interacts) {
+                    int index = neighborsInBuffer+__popc(includeAtomFlags&warpMask);
+                    buffer[index] = atom2;
+                    flagsBuffer[index] = interacts;
+                }
+                __syncwarp();
+                neighborsInBuffer += __popc(includeAtomFlags);
+                if (neighborsInBuffer > BUFFER_SIZE-TILE_SIZE) {
+                    // Store the new tiles to memory.
+
+#if MAX_BITS_FOR_PAIRS > 0
+                    neighborsInBuffer = saveSinglePairs(x, buffer, flagsBuffer, neighborsInBuffer, maxSinglePairs, &interactionCount[1], singlePairs);
+#endif
+                    unsigned int tilesToStore = neighborsInBuffer/TILE_SIZE;
+                    if (tilesToStore > 0) {
+                        unsigned int newTileStartIndex = (indexInWarp == 0 ? atomicAdd(&interactionCount[0], tilesToStore) : 0);
+                        newTileStartIndex = __shfl_sync(0xffffffff, newTileStartIndex, 0);
+                        if (newTileStartIndex+tilesToStore <= maxTiles) {
+                            if (indexInWarp < tilesToStore)
+                                interactingTiles[newTileStartIndex+indexInWarp] = x;
+                            #pragma unroll 8 // (GROUP_SIZE / TILE_SIZE)
+                            for (int j = 0; j < tilesToStore; j++)
+                                interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = buffer[indexInWarp+j*TILE_SIZE];
+                        }
+                        __syncwarp();
+                        if (indexInWarp+TILE_SIZE*tilesToStore < BUFFER_SIZE) {
+                            buffer[indexInWarp] = buffer[indexInWarp+TILE_SIZE*tilesToStore];
+                            flagsBuffer[indexInWarp] = flagsBuffer[indexInWarp+TILE_SIZE*tilesToStore];
+                        }
+                        __syncwarp();
+                        neighborsInBuffer -= TILE_SIZE*tilesToStore;
+                    }
+                }
+            }
+        }
+
+        // If we have a partially filled buffer, store it to memory.
+
+#if MAX_BITS_FOR_PAIRS > 0
+        if (neighborsInBuffer > 32)
+            neighborsInBuffer = saveSinglePairs(x, buffer, flagsBuffer, neighborsInBuffer, maxSinglePairs, &interactionCount[1], singlePairs);
+#endif
+        if (neighborsInBuffer > 0) {
+            unsigned int tilesToStore = (neighborsInBuffer+TILE_SIZE-1)/TILE_SIZE;
+            unsigned int newTileStartIndex = (indexInWarp == 0 ? atomicAdd(&interactionCount[0], tilesToStore) : 0);
+            newTileStartIndex = __shfl_sync(0xffffffff, newTileStartIndex, 0);
+            if (newTileStartIndex+tilesToStore <= maxTiles) {
+                if (indexInWarp < tilesToStore)
+                    interactingTiles[newTileStartIndex+indexInWarp] = x;
+                #pragma unroll 8 // (GROUP_SIZE / TILE_SIZE)
+                for (int j = 0; j < tilesToStore; j++)
+                    interactingAtoms[(newTileStartIndex+j)*TILE_SIZE+indexInWarp] = (indexInWarp+j*TILE_SIZE < neighborsInBuffer ? buffer[indexInWarp+j*TILE_SIZE] : NUM_ATOMS);
+            }
+        }
+    }
+}
+#else
 /**
  * Find a bounding box for the atoms in each block.
  */
@@ -137,10 +680,6 @@ extern "C" __global__ void computeSortKeys(const real4* __restrict__ blockBoundi
  */
 extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBlocks, const real4* __restrict__ blockCenter,
         const real4* __restrict__ blockBoundingBox, real4* __restrict__ sortedBlockCenter, half3* __restrict__ sortedBlockBoundingBox,
-#ifdef USE_LARGE_BLOCKS
-        real4* __restrict__ largeBlockCenter, half3* __restrict__ largeBlockBoundingBox, real4 periodicBoxSize,
-        real4 invPeriodicBoxSize, real4 periodicBoxVecX, real4 periodicBoxVecY, real4 periodicBoxVecZ,
-#endif
         const real4* __restrict__ posq, const real4* __restrict__ oldPositions,
         unsigned int* __restrict__ interactionCount, int* __restrict__ rebuildNeighborList, bool forceRebuild) {
     for (int i = threadIdx.x+blockIdx.x*blockDim.x; i < NUM_BLOCKS; i += blockDim.x*gridDim.x) {
@@ -148,26 +687,6 @@ extern "C" __global__ void sortBoxData(const unsigned int* __restrict__ sortedBl
         sortedBlockCenter[i] = blockCenter[index];
         sortedBlockBoundingBox[i] = half3(trimTo3(blockBoundingBox[index]));
 
-#ifdef USE_LARGE_BLOCKS
-        // Compute the sizes of large blocks (composed of 32 regular blocks) starting from each block.
-    
-        real4 minPos = blockCenter[index]-blockBoundingBox[index];
-        real4 maxPos = blockCenter[index]+blockBoundingBox[index];
-        int last = min(i+32, NUM_BLOCKS);
-        for (int j = i+1; j < last; j++) {
-            unsigned int index2 = sortedBlocks[j] & BLOCK_INDEX_MASK;
-            real4 blockPos = blockCenter[index2];
-            real4 width = blockBoundingBox[index2];
-#ifdef USE_PERIODIC
-            real4 center = 0.5f*(maxPos+minPos);
-            APPLY_PERIODIC_TO_POS_WITH_CENTER(blockPos, center)
-#endif
-            minPos = make_real4(min(minPos.x, blockPos.x-width.x), min(minPos.y, blockPos.y-width.y), min(minPos.z, blockPos.z-width.z), 0);
-            maxPos = make_real4(max(maxPos.x, blockPos.x+width.x), max(maxPos.y, blockPos.y+width.y), max(maxPos.z, blockPos.z+width.z), 0);
-        }
-        largeBlockCenter[i] = 0.5f*(maxPos+minPos);
-        largeBlockBoundingBox[i] = half3(trimTo3(0.5f*(maxPos-minPos)));
-#endif
     }
 
     // Also check whether any atom has moved enough so that we really need to rebuild the neighbor list.
@@ -290,9 +809,6 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
         unsigned int* __restrict__ interactionCount, int* __restrict__ interactingTiles, unsigned int* __restrict__ interactingAtoms,
         int2* __restrict__ singlePairs, const real4* __restrict__ posq, unsigned int maxTiles, unsigned int maxSinglePairs, unsigned int startBlockIndex,
         unsigned int numBlocks, unsigned int* __restrict__ sortedBlocks, const real4* __restrict__ sortedBlockCenter, const half3* __restrict__ sortedBlockBoundingBox,
-#ifdef USE_LARGE_BLOCKS
-        real4* __restrict__ largeBlockCenter, half3* __restrict__ largeBlockBoundingBox,
-#endif
         const unsigned int* __restrict__ exclusionIndices, const unsigned int* __restrict__ exclusionRowIndices,
         real4* __restrict__ oldPositions, const int* __restrict__ rebuildNeighborList) {
 
@@ -355,48 +871,7 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
         // Loop over atom blocks to search for neighbors.  The threads in a warp compare block1 against 32
         // other blocks in parallel.
 
-#ifdef USE_LARGE_BLOCKS
-        int largeBlockFlags = 0;
-        int loadedLargeBlocks = 0;
-#endif
         for (int block2Base = block1+1; block2Base < NUM_BLOCKS; block2Base += 32) {
-#ifdef USE_LARGE_BLOCKS
-            if (loadedLargeBlocks == 0) {
-                // Check the next set of large blocks.
-
-                int largeBlockIndex = block2Base + 32*indexInWarp;
-                bool includeLargeBlock = false;
-                if (largeBlockIndex < NUM_BLOCKS) {
-                    real4 largeCenter = largeBlockCenter[largeBlockIndex];
-                    real3 largeSize = largeBlockBoundingBox[largeBlockIndex].toReal3();
-                    real4 blockDelta = blockCenterX-largeCenter;
-#ifdef USE_PERIODIC
-                    APPLY_PERIODIC_TO_DELTA(blockDelta)
-#endif
-                    blockDelta.x = max(0.0f, fabs(blockDelta.x)-blockSizeX.x-largeSize.x);
-                    blockDelta.y = max(0.0f, fabs(blockDelta.y)-blockSizeX.y-largeSize.y);
-                    blockDelta.z = max(0.0f, fabs(blockDelta.z)-blockSizeX.z-largeSize.z);
-                    includeLargeBlock = (blockDelta.x*blockDelta.x+blockDelta.y*blockDelta.y+blockDelta.z*blockDelta.z < PADDED_CUTOFF_SQUARED);
-#ifdef TRICLINIC
-                    // The calculation to find the nearest periodic copy is only guaranteed to work if the nearest copy is less than half a box width away.
-                    // If there's any possibility we might have missed it, do a detailed check.
-
-                    if (periodicBoxSize.z/2-blockSizeX.z-largeSize.z < PADDED_CUTOFF || periodicBoxSize.y/2-blockSizeX.y-largeSize.y < PADDED_CUTOFF)
-                        includeLargeBlock = true;
-#endif
-                }
-                largeBlockFlags = BALLOT(includeLargeBlock);
-                loadedLargeBlocks = 32;
-            }
-            loadedLargeBlocks--;
-            if ((largeBlockFlags&1) == 0) {
-                // None of the next 32 blocks interact with block 1.
-
-                largeBlockFlags >>= 1;
-                continue;
-            }
-            largeBlockFlags >>= 1;
-#endif
             int block2 = block2Base+indexInWarp;
             bool includeBlock2 = (block2 < NUM_BLOCKS);
             bool forceInclude = false;
@@ -540,3 +1015,4 @@ extern "C" __global__ __launch_bounds__(GROUP_SIZE,3) void findBlocksWithInterac
     for (int i = threadIdx.x+blockIdx.x*blockDim.x; i < NUM_ATOMS; i += blockDim.x*gridDim.x)
         oldPositions[i] = posq[i];
 }
+#endif
