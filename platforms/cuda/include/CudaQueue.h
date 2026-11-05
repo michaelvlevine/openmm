@@ -38,8 +38,11 @@ class CudaQueue : public ComputeQueueImpl {
 public:
     /**
      * Create a CudaQueue that wraps an existing CUstream.
+     *
+     * @param stream         the CUDA stream to wrap
+     * @param takeOwnership  if true, the CudaQueue destroys the stream when it is deleted
      */
-    CudaQueue(CUstream stream);
+    CudaQueue(CUstream stream, bool takeOwnership = false);
     /**
      * Create a CudaQueue that create a new CUstream.
      */
