@@ -136,6 +136,57 @@ extern "C" __global__ void computeNonbonded(
         const bool hasExclusions = true;
         if (x == y) {
             // This tile is on the diagonal.
+#if defined(USE_SYMMETRIC) && defined(USE_EXCLUSIONS)
+            real4 shflPosq = posq1;
+            real3 shflForce = make_real3(0);
+            DECLARE_LOCAL_PARAMETERS
+            COPY_ATOM1_TO_LOCAL_PARAMETERS
+            excl = __funnelshift_r(excl, excl, tgx + 1);
+            SHUFFLE_WARP_DATA
+            // Evaluate each unordered pair once across TILE_SIZE/2 shifts; at j == TILE_SIZE/2 - 1
+            // only the lower half-warp includes the antipodal pair, then shflForce folds back.
+            #pragma unroll 4
+            for (unsigned int j = 0; j < TILE_SIZE/2; j++) {
+                int atom2 = y*TILE_SIZE + ((tgx+j+1) & (TILE_SIZE-1));
+                real4 posq2 = shflPosq;
+                real3 delta = make_real3(posq2.x-posq1.x, posq2.y-posq1.y, posq2.z-posq1.z);
+#ifdef USE_PERIODIC
+                APPLY_PERIODIC_TO_DELTA(delta)
+#endif
+                real r2 = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z;
+                bool includePair = (!(j == TILE_SIZE/2 - 1 && tgx >= TILE_SIZE/2) && atom1 < NUM_ATOMS && atom2 < NUM_ATOMS);
+#ifdef USE_CUTOFF
+                includePair &= (r2 < MAX_CUTOFF_SQUARED);
+#endif
+                if (includePair) {
+                    real invR = RSQRT(r2);
+                    real r = r2*invR;
+                    LOAD_ATOM2_PARAMETERS
+                    real dEdR = 0.0f;
+                    bool isExcluded = !(excl & 0x1);
+                    real tempEnergy = 0.0f;
+                    const real interactionScale = 1.0f;
+                    COMPUTE_INTERACTION
+                    energy += tempEnergy;
+#ifdef INCLUDE_FORCES
+                    delta *= dEdR;
+                    force.x -= delta.x;
+                    force.y -= delta.y;
+                    force.z -= delta.z;
+                    shflForce.x += delta.x;
+                    shflForce.y += delta.y;
+                    shflForce.z += delta.z;
+#endif
+                }
+                SHUFFLE_WARP_DATA
+                excl >>= 1;
+            }
+#ifdef INCLUDE_FORCES
+            force.x += real_shfl(shflForce.x, tgx + TILE_SIZE/2 - 1);
+            force.y += real_shfl(shflForce.y, tgx + TILE_SIZE/2 - 1);
+            force.z += real_shfl(shflForce.z, tgx + TILE_SIZE/2 - 1);
+#endif
+#else
             real4 shflPosq = posq1;
 
             // we do not need to fetch parameters from global since this is a symmetric tile
@@ -181,6 +232,7 @@ extern "C" __global__ void computeNonbonded(
                 excl >>= 1;
 #endif
             }
+#endif
         }
         else {
             // This is an off-diagonal tile.
