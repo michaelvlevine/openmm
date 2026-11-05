@@ -887,7 +887,10 @@ void IntegrationUtilities::initRandomNumberGenerator(unsigned int randomNumberSe
     // Create the random number arrays.
 
     lastSeed = randomNumberSeed;
-    random.initialize<mm_float4>(context, 4*context.getPaddedNumAtoms(), "random");
+    const int maxRandomValues = (8*1024*1024)/sizeof(mm_float4);
+    int paddedNumAtoms = context.getPaddedNumAtoms();
+    int numSteps = max(4, min(32, maxRandomValues/max(1, paddedNumAtoms)));
+    random.initialize<mm_float4>(context, numSteps*paddedNumAtoms, "random");
     randomSeed.initialize<mm_int4>(context, context.getNumThreadBlocks()*64, "randomSeed");
     randomPos = random.getSize();
     randomKernel->addArg((int) random.getSize());
