@@ -609,10 +609,13 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
     replacements["BROADCAST_WARP_DATA"] = broadcastWarpData.str();
     
     // Part 2. Defines for off-diagonal exclusions, and neighborlist tiles. 
-    stringstream declareLocal2;
-    for (const ComputeParameterInfo& param : params)
+    stringstream declareLocal2, copyAtom1ToLocal2;
+    for (const ComputeParameterInfo& param : params) {
         declareLocal2<<param.getType()<<" shfl"<<param.getName()<<";\n";
+        copyAtom1ToLocal2<<"shfl"<<param.getName()<<" = "<<param.getName()<<"1;\n";
+    }
     replacements["DECLARE_LOCAL_PARAMETERS"] = declareLocal2.str();
+    replacements["COPY_ATOM1_TO_LOCAL_PARAMETERS"] = copyAtom1ToLocal2.str();
 
     stringstream loadLocal2;
     for (const ComputeParameterInfo& param : params)
@@ -702,6 +705,7 @@ CUfunction CudaNonbondedUtilities::createInteractionKernel(const string& source,
         }
     }
     defines["MAX_CUTOFF"] = context.doubleToString(maxCutoff);
+    defines["MAX_CUTOFF_SQUARED"] = context.doubleToString(maxCutoff*maxCutoff);
     defines["NUM_ATOMS"] = context.intToString(context.getNumAtoms());
     defines["PADDED_NUM_ATOMS"] = context.intToString(context.getPaddedNumAtoms());
     defines["NUM_BLOCKS"] = context.intToString(context.getNumAtomBlocks());
